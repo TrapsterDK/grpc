@@ -713,6 +713,9 @@ class HPackParser::Parser {
     LOG(INFO) << "HTTP:" << log_info_.stream_id << ":" << type << ":"
               << (log_info_.is_client ? "CLI" : "SVR") << ": "
               << memento.md.DebugString()
+              << (memento.parse_status.TestBit(HPackTable::Memento::kDiscardBit)
+                      ? " (discarded)"
+                      : "")
               << (memento.parse_status.get() == nullptr
                       ? ""
                       : absl::StrCat(
@@ -728,7 +731,9 @@ class HPackParser::Parser {
       // Reject any requests with invalid metadata.
       input_->SetErrorAndContinueParsing(*md.parse_status);
     }
-    if (GPR_LIKELY(metadata_buffer_ != nullptr)) {
+    const bool discarded =
+        md.parse_status.TestBit(HPackTable::Memento::kDiscardBit);
+    if (GPR_LIKELY(metadata_buffer_ != nullptr && !discarded)) {
       if (IsMapHostHeaderToAuthorityEnabled()) {
         if (GPR_UNLIKELY(metadata_buffer_->get_pointer(
                              HttpAuthorityMetadata()) != nullptr &&
@@ -969,6 +974,7 @@ class HPackParser::Parser {
 
   bool ParseValueBody() {
     GRPC_DCHECK(state_.parse_state == ParseState::kParsingValueBody);
+    bool discard_current_metadata = false;
     auto value =
         state_.is_binary_header
             ? String::ParseBinary(input_, state_.is_string_huff_compressed,
@@ -1036,20 +1042,38 @@ class HPackParser::Parser {
           input_->SetErrorAndContinueParsing(
               HpackParseResult::MitigationEngineError(
                   key_string, MitigationEngine::Action::kRejectRpc));
+        } else if (action.value() ==
+                   MitigationEngine::Action::kDiscardMetadata) {
+          discard_current_metadata = true;
         }
       }
     }
-    auto md = grpc_metadata_batch::Parse(
-        key_string, std::move(value_slice), state_.add_to_table, transport_size,
-        [key_string, this](absl::string_view message, const Slice&) {
-          if (!state_.field_error.ok()) return;
-          input_->SetErrorAndContinueParsing(
-              HpackParseResult::MetadataParseError(key_string));
-          LOG(ERROR) << "Error parsing '" << key_string
-                     << "' metadata: " << message;
-        });
+    ParsedMetadata<grpc_metadata_batch> md;
+    if (GPR_UNLIKELY(discard_current_metadata)) {
+      if (state_.add_to_table) {
+        md = ParsedMetadata<grpc_metadata_batch>(
+            ParsedMetadata<grpc_metadata_batch>::FromSlicePair{},
+            Slice::FromCopiedString(key_string), Slice(), transport_size);
+      } else {
+        state_.frame_length += transport_size;
+      }
+    } else {
+      md = grpc_metadata_batch::Parse(
+          key_string, std::move(value_slice), state_.add_to_table,
+          transport_size,
+          [key_string, this](absl::string_view message, const Slice&) {
+            if (!state_.field_error.ok()) return;
+            input_->SetErrorAndContinueParsing(
+                HpackParseResult::MetadataParseError(key_string));
+            LOG(ERROR) << "Error parsing '" << key_string
+                       << "' metadata: " << message;
+          });
+    }
     HPackTable::Memento memento{
         std::move(md), state_.field_error.PersistentStreamErrorOrNullptr()};
+    if (GPR_UNLIKELY(discard_current_metadata)) {
+      memento.parse_status.SetBit(HPackTable::Memento::kDiscardBit);
+    }
     input_->UpdateFrontier();
     state_.parse_state = ParseState::kTop;
     if (state_.add_to_table) {
